@@ -1,151 +1,124 @@
+import os
+import numpy as np
+import faiss
 import streamlit as st
-import pandas as pd
-import math
-from pathlib import Path
+import google.generativeai as genai
+from langchain.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_cohere import CohereEmbeddings
+from langchain_google_genai import GoogleGenerativeAI
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
-)
+# Configuration
+COHERE_API_KEY = "01YL5TQxIsz1SXKTffDBWzXuX6M5Yf8HDxvIfe2G"
+GOOGLE_API_KEY = "AIzaSyBPg52dZBy6mECGJiMmaiLw4l4tNLvkILY"
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
-
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
-
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
-
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
-
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
-
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
-    )
-
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
-
-    return gdp_df
-
-gdp_df = get_gdp_data()
-
-# -----------------------------------------------------------------------------
-# Draw the actual page
-
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
-
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
-
-# Add some spacing
-''
-''
-
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
-
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
-
-countries = gdp_df['Country Code'].unique()
-
-if not len(countries):
-    st.warning("Select at least one country")
-
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
-
-''
-''
-''
-
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
-
-st.header('GDP over time', divider='gray')
-
-''
-
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
-)
-
-''
-''
-
-
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
-
-st.header(f'GDP in {to_year}', divider='gray')
-
-''
-
-cols = st.columns(4)
-
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
-
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
-        else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
-
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
+class DocumentProcessor:
+    def __init__(self):
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=300,
+            chunk_overlap=40,
+            length_function=len,
+            is_separator_regex=False,
         )
+        self.embeddings_model = CohereEmbeddings(
+            cohere_api_key=COHERE_API_KEY, 
+            model='embed-english-v2.0'
+        )
+
+    def process_pdf(self, pdf_file):
+        """Process uploaded PDF file"""
+        # Save uploaded file temporarily
+        with open("temp.pdf", "wb") as f:
+            f.write(pdf_file.getbuffer())
+
+        # Load and process the PDF
+        loader = PyPDFLoader("temp.pdf")
+        documents = loader.load()
+        chunks = self.text_splitter.split_documents(documents)
+        
+        # Generate embeddings
+        texts = [doc.page_content for doc in chunks]
+        embeddings = self.embeddings_model.embed_documents(texts)
+        
+        # Create FAISS index
+        dimension = len(embeddings[0])
+        index = faiss.IndexFlatL2(dimension)
+        embeddings_array = np.array(embeddings).astype('float32')
+        index.add(embeddings_array)
+
+        # Clean up
+        os.remove("temp.pdf")
+        
+        return texts, index
+
+class QuestionAnswerer:
+    def __init__(self, embeddings_model):
+        self.embeddings_model = embeddings_model
+        genai.configure(api_key=GOOGLE_API_KEY)
+        self.llm = GoogleGenerativeAI(
+            model="gemini-pro",
+            google_api_key=GOOGLE_API_KEY,
+            temperature=0.7
+        )
+
+    def get_answer(self, question: str, texts: list, index: faiss.IndexFlatL2):
+        """Get answer for the given question"""
+        # Get embedding for the question
+        question_embedding = self.embeddings_model.embed_documents([question])[0]
+        question_embedding = np.array(question_embedding).astype('float32').reshape(1, -1)
+        
+        # Search for similar chunks
+        distances, indices = index.search(question_embedding, 3)
+        relevant_chunks = [texts[i] for i in indices[0]]
+
+        # Create prompt
+        prompt = f"""Based on the following context, please answer the question that is asked by
+        the user related to the context that is provided.
+        
+        
+
+        Context:
+        {' '.join(relevant_chunks)}
+
+        Question: {question}
+
+        Answer:"""
+
+        # Generate response
+        response = self.llm.invoke(prompt)
+        return response, relevant_chunks
+
+def main():
+    st.title("Document Q&A System")
+    st.write("Upload a PDF document and ask questions about it!")
+
+    # Initialize processors
+    doc_processor = DocumentProcessor()
+    qa_system = QuestionAnswerer(doc_processor.embeddings_model)
+
+    # File upload
+    uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
+    
+    if uploaded_file is not None:
+        with st.spinner('Processing document...'):
+            texts, index = doc_processor.process_pdf(uploaded_file)
+            st.success('Document processed successfully!')
+
+        # Question input
+        question = st.text_input("Ask a question about the document:")
+        
+        if question:
+            with st.spinner('Generating answer...'):
+                answer, context = qa_system.get_answer(question, texts, index)
+                
+                st.write("### Answer:")
+                st.write(answer)
+                
+                with st.expander("View Source Context"):
+                    for i, chunk in enumerate(context, 1):
+                        st.write(f"Chunk {i}:")
+                        st.write(chunk)
+                        st.write("---")
+
+if __name__ == "__main__":
+    main()
